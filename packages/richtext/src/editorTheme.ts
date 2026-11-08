@@ -224,14 +224,16 @@ const editorTheme = stylex.create({
       ':last-child': spacingVars['--spacing-0'],
     },
     maxWidth: PROSE_MEASURE,
-    // The indent lives on the item, not here. An `outside` marker is drawn
-    // beyond the item's own start edge, which is the opposite edge from the
-    // list's when the two directions disagree; an indent held by the list
-    // would then reserve room on the side the marker is not on, and a task
-    // item's negative compensation would push it past the field. Held by
-    // the item, the room is always on the side the marker uses. A list whose
-    // items all agree with it lays out exactly as before.
+    // Room on both inline sides, not only the start. An `outside` marker is
+    // drawn beyond its item's own start edge, and an item that reads against
+    // its list starts on the opposite edge, so room reserved on one side
+    // only leaves that item's marker outside the field and flattens a
+    // nesting step to nothing. Reserved on both, every level steps in by one
+    // inset whichever way its items read, and a list whose items all agree
+    // with it keeps the geometry it had. The end side costs one inset of
+    // measure per nesting level, which is what buys a level that holds.
     listStylePosition: 'outside',
+    paddingInline: spacingVars['--spacing-6'],
   },
   ol: {
     marginBlockStart: {
@@ -243,14 +245,16 @@ const editorTheme = stylex.create({
       ':last-child': spacingVars['--spacing-0'],
     },
     maxWidth: PROSE_MEASURE,
-    // The indent lives on the item, not here. An `outside` marker is drawn
-    // beyond the item's own start edge, which is the opposite edge from the
-    // list's when the two directions disagree; an indent held by the list
-    // would then reserve room on the side the marker is not on, and a task
-    // item's negative compensation would push it past the field. Held by
-    // the item, the room is always on the side the marker uses. A list whose
-    // items all agree with it lays out exactly as before.
+    // Room on both inline sides, not only the start. An `outside` marker is
+    // drawn beyond its item's own start edge, and an item that reads against
+    // its list starts on the opposite edge, so room reserved on one side
+    // only leaves that item's marker outside the field and flattens a
+    // nesting step to nothing. Reserved on both, every level steps in by one
+    // inset whichever way its items read, and a list whose items all agree
+    // with it keeps the geometry it had. The end side costs one inset of
+    // measure per nesting level, which is what buys a level that holds.
     listStylePosition: 'outside',
+    paddingInline: spacingVars['--spacing-6'],
   },
   // Markers by depth (spec:AST-061 DEC-6): a list nested inside n lists, of
   // either kind, draws disc, circle, or square, or writes decimal,
@@ -297,10 +301,10 @@ const editorTheme = stylex.create({
     // A task item's text starts 28px in, after core's small checkbox (20px)
     // and its 8px gap, like core Markdown's task lists.
     marginInlineStart: {
-      default: spacingVars['--spacing-6'],
+      default: LIST_ROW_FLUSH,
       // A task item draws a checkbox inside its own padding instead of a
-      // marker, so it needs no room outside itself.
-      ':is([data-richtext-task])': LIST_ROW_FLUSH,
+      // marker, so it gives back the room the list reserves for one.
+      ':is([data-richtext-task])': `calc(-1 * ${spacingVars['--spacing-6']})`,
     },
     paddingInlineStart: {
       default: LIST_ROW_FLUSH,

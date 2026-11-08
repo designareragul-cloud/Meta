@@ -307,6 +307,104 @@ describe('a top-level block carries its own direction (spec:AST-061 FR6)', () =>
     ).toEqual(['ltr', 'ltr', 'ltr', 'ltr', 'ltr']);
   });
 
+  it('reads the Arabic marks whose script is Common, and skips weak numerals', async () => {
+    // Bidi_Class AL, but Script=Common rather than Arabic. Tatweel is also a
+    // modifier letter, so \p{Letter} would otherwise call it left-to-right.
+    expect(
+      firstStrongDirection('\u0640\u0647\u0627 \u0636\u0645\u064a\u0631'),
+    ).toBe('rtl');
+    expect(firstStrongDirection('\u0640')).toBe('rtl');
+    expect(firstStrongDirection('\u061b Annual')).toBe('rtl');
+    expect(firstStrongDirection('\u061f Annual')).toBe('rtl');
+
+    // Bidi_Class CS, not AL: the Arabic comma separates and decides nothing.
+    expect(firstStrongDirection('\u060c Annual')).toBe('ltr');
+
+    // Bidi_Class AN. These sit inside the right-to-left planes the strong
+    // ranges cover, so they have to be named weak explicitly.
+    expect(firstStrongDirection('\u{10E60}\u{10E61} Annual report')).toBe(
+      'ltr',
+    );
+    expect(firstStrongDirection('\u{1EC71} Annual')).toBe('ltr');
+    expect(firstStrongDirection('\u{1ED01} Annual')).toBe('ltr');
+    expect(firstStrongDirection('\u{10E60}')).toBeNull();
+
+    // Still strong in the same planes: Mende Kikakui, Adlam, Arabic maths.
+    expect(firstStrongDirection('\u{1E802}')).toBe('rtl');
+    expect(firstStrongDirection('\u{1E950}\u{1E951}')).toBe('rtl');
+    expect(firstStrongDirection('\u{1EE01}')).toBe('rtl');
+  });
+
+  it('settles a wrapper when a nested item is removed, in the same update', async () => {
+    const editor = createEditor({
+      namespace: 'block-direction-removal',
+      nodes: [
+        ListNode,
+        ListItemNode,
+        HeadingNode,
+        QuoteNode,
+        CodeNode,
+        TableNode,
+        TableRowNode,
+        TableCellNode,
+      ],
+      onError: error => {
+        throw error;
+      },
+    });
+    const teardown = registerBlockDirection(editor);
+
+    let wrapper: ListItemNode | null = null;
+    let hebrew: ListItemNode | null = null;
+    editor.update(
+      () => {
+        const outer = $createListNode('bullet');
+        wrapper = $createListItemNode();
+        const inner = $createListNode('bullet');
+        hebrew = $createListItemNode();
+        hebrew.append($createTextNode('\u05e9'));
+        const english = $createListItemNode();
+        english.append($createTextNode('a'));
+        inner.append(hebrew, english);
+        wrapper.append(inner);
+        outer.append(wrapper);
+        $getRoot().clear().append(outer);
+      },
+      {discrete: true},
+    );
+
+    // The Hebrew item came first, so the wrapper reads right-to-left.
+    editor.getEditorState().read(() => {
+      expect(wrapper?.getLatest().getDirection()).toBe('rtl');
+    });
+
+    // Removing it leaves only English under the wrapper. Removing a node
+    // dirties its parent, not the wrapper, so the wrapper has to be settled
+    // by the walk rather than by the history-merge sweep a step later.
+    const states: Array<{tags: Set<string>; dir: string | null}> = [];
+    const stop = editor.registerUpdateListener(({editorState, tags}) => {
+      editorState.read(() => {
+        states.push({
+          tags: new Set(tags),
+          dir: wrapper?.getLatest().getDirection() ?? null,
+        });
+      });
+    });
+    editor.update(
+      () => {
+        hebrew?.remove();
+      },
+      {discrete: true},
+    );
+
+    const typed = states.find(state => !state.tags.has('history-merge'));
+    expect(typed).toBeDefined();
+    expect(typed?.dir).toBe('ltr');
+
+    stop();
+    teardown();
+  });
+
   it('skips combining marks and reads letter numbers as strong', async () => {
     // A combining mark is Bidi_Class NSM: it takes the direction of the
     // character it sits on and is never strong itself. It also carries that

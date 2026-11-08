@@ -2164,6 +2164,66 @@ for (const direction of ['ltr', 'rtl'] as const) {
   // their order and a column's start edge is the document's. The paragraph
   // inside a cell is prose and takes its own, so a cell of English in a
   // right-to-left document reads and is edited left-to-right.
+  test(`a nested list steps in once per level whichever way its items read (${direction})`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(PHONE);
+    await page.goto(
+      `${storybook.origin}/iframe.html?id=richtext-richtexteditor--markdown-serializers&viewMode=story&globals=astryxTheme:neutral;colorMode:light;direction:${direction}`,
+      {waitUntil: 'load'},
+    );
+    // A Hebrew item first, so the wrapper that holds the nested list reads
+    // right-to-left while the items inside it read left-to-right. An inset
+    // reserved only on the wrapper's own side would leave both nested levels
+    // starting on the top level's line.
+    await page
+      .locator('textarea')
+      .fill(
+        '- \u05e9\u05dc\u05d5\u05dd one\n  - Nested English\n    - Deeper English\n',
+      );
+    await expect(
+      page.locator('[data-lexical-editor] li').first(),
+    ).toBeVisible();
+    const starts = await page.evaluate(() =>
+      [...document.querySelectorAll('[data-lexical-editor]')].map(editor => {
+        const list = editor.querySelector('ul');
+        if (list === null) {
+          return [];
+        }
+        const listBox = list.getBoundingClientRect();
+        return [...editor.querySelectorAll('li')]
+          .filter(
+            item =>
+              (item.textContent ?? '').trim() !== '' &&
+              item.querySelector('ul, ol') === null,
+          )
+          .map(item => {
+            const range = document.createRange();
+            range.selectNodeContents(item);
+            const text = range.getBoundingClientRect();
+            return getComputedStyle(item).direction === 'rtl'
+              ? Math.round(listBox.right - text.right)
+              : Math.round(text.left - listBox.left);
+          });
+      }),
+    );
+    // Editor and view. Each level steps in by one inset from the list's own
+    // edge on the side that item's text starts from.
+    for (const surface of starts.filter(list => list.length > 0)) {
+      expect(surface).toHaveLength(3);
+      const [first, second, third] = surface;
+      expect(second - first).toBeGreaterThan(8);
+      expect(third - second).toBe(second - first);
+    }
+    // No level pushes a marker or a line outside the field.
+    const overflow = await page.evaluate(() =>
+      [...document.querySelectorAll('[data-lexical-editor]')].map(
+        editor => editor.scrollWidth - editor.clientWidth,
+      ),
+    );
+    expect(overflow.every(value => value <= 0)).toBe(true);
+  });
+
   test(`a cell reads past a combining mark and reads a letter number (${direction})`, async ({
     page,
   }) => {

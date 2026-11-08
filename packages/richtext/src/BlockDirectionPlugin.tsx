@@ -90,6 +90,14 @@ function $isOwnDirectionBlock(node: LexicalNode): node is ElementNode {
 /**
  * The strongly right-to-left characters of the Unicode Bidirectional
  * Algorithm — Bidi_Class `R` and `AL`.
+ *
+ * JavaScript exposes no `\p{Bidi_Class=…}` escape, so these sets approximate
+ * that property from script and category membership and are corrected where
+ * the two disagree. Four `AL` characters are written out because their
+ * script is `Common` rather than `Arabic`: the semicolon, the Arabic letter
+ * mark, the question mark, and tatweel, which is also a modifier letter and
+ * so would otherwise read as strongly left-to-right.
+ *
  * Living scripts are named so the set reads as what it is; the two ranges
  * cover the historic right-to-left scripts in the Supplementary Multilingual
  * Plane (Phoenician, Kharoshthi, Old Hungarian, Mende Kikakui, …), which have
@@ -104,21 +112,22 @@ function $isOwnDirectionBlock(node: LexicalNode): node is ElementNode {
  * answer out would have been worse than leaving the attribute alone.
  */
 const STRONG_RTL =
-  /[\p{Script=Adlam}\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Mandaic}\p{Script=Nko}\p{Script=Samaritan}\p{Script=Syriac}\p{Script=Thaana}\u200F\u061C\u{10800}-\u{10FFF}\u{1E800}-\u{1EFFF}]/u;
+  /[\p{Script=Adlam}\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Mandaic}\p{Script=Nko}\p{Script=Samaritan}\p{Script=Syriac}\p{Script=Thaana}\u061B\u061C\u061F\u0640\u200F\u{10800}-\u{10FFF}\u{1E800}-\u{1EFFF}]/u;
 
 /**
- * The Arabic script's weak characters: its digits and their extended forms,
- * the number signs that introduce them, and the currency and per-cent marks
- * that sit beside them. All are Bidi_Class `AN`, `EN` or `ET` — weak, not
- * strong — so the first-strong scan passes over them and `۱۴۰۳ Annual
- * report` and `٪50 off` both read left-to-right.
+ * The weak number characters of right-to-left scripts: Bidi_Class `AN`, `EN`
+ * or `ET`. The Arabic digits and their extended forms, the number signs that
+ * introduce them, the currency and per-cent marks beside them, and the Rumi,
+ * Indic Siyaq and Ottoman Siyaq number blocks, which the ranges above would
+ * otherwise take as strong. The first-strong scan passes over all of them, so
+ * `۱۴۰۳ Annual report` and `٪50 off` read left-to-right.
  *
  * Not every right-to-left digit is weak: NKo's (`U+07C0`–`U+07C9`) and
  * Adlam's (`U+1E950`–`U+1E959`) are Bidi_Class `R`, so they are deliberately
  * absent here and a block opening with one reads right-to-left.
  */
-const WEAK_ARABIC_NUMBER =
-  /[\u0600-\u0605\u0609\u060A\u0660-\u0669\u066A-\u066C\u06DD\u06F0-\u06F9\u0890\u0891\u08E2]/u;
+const WEAK_RTL_NUMBER =
+  /[\u0600-\u0605\u0609\u060A\u0660-\u0669\u066A-\u066C\u06DD\u06F0-\u06F9\u0890\u0891\u08E2\u{10E60}-\u{10E7F}\u{1EC70}-\u{1ECBF}\u{1ED00}-\u{1ED4F}]/u;
 
 /**
  * Bidi_Class `L`: any other letter, the letter numbers (Roman numeral `Ⅰ`
@@ -146,7 +155,7 @@ const COMBINING_MARK = /\p{Mark}/u;
  */
 export function firstStrongDirection(text: string): 'ltr' | 'rtl' | null {
   for (const character of text) {
-    if (COMBINING_MARK.test(character) || WEAK_ARABIC_NUMBER.test(character)) {
+    if (COMBINING_MARK.test(character) || WEAK_RTL_NUMBER.test(character)) {
       continue;
     }
     if (STRONG_RTL.test(character)) {
@@ -248,13 +257,21 @@ export function registerBlockDirection(editor: LexicalEditor): () => void {
     // own being dirtied — a new empty paragraph, a heading conversion, a
     // list item split, a deletion that empties a block.
     ...PROSE_NODES.map(klass =>
-      editor.registerNodeTransform(klass, $writeOwnDirection),
+      editor.registerNodeTransform(klass, node => {
+        $proseContainers(node).forEach($writeOwnDirection);
+      }),
     ),
     // A container that arrives carrying a direction — pasted HTML, or an
     // older stored document — gives it up, so its contents are ordered by
-    // the document as they are everywhere else.
+    // the document as they are everywhere else. Removing a node dirties its
+    // parent, so a removed list item reaches its list here; the walk settles
+    // the wrapper above it in the same update, which the sweep below would
+    // otherwise do a history step later.
     ...CONTAINER_NODES.map(klass =>
-      editor.registerNodeTransform(klass, $writeOwnDirection),
+      editor.registerNodeTransform(klass, node => {
+        $writeOwnDirection(node);
+        $proseContainers(node).forEach($writeOwnDirection);
+      }),
     ),
     // Replacing the whole state runs no transform at all, and RichTextView
     // does exactly that whenever its `value` changes. Sweep the document
