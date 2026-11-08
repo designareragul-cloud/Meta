@@ -7,10 +7,11 @@
  * @output Whether focus would be lost if a surface hid now; a focus move whose
  *   ring follows the last input; the focus return of a closed overlay, which
  *   never scrolls the page; and the one path that moves focus out of content a
- *   change removed or hid (`noteFocusWithin`, `moveFocusLeftBehind`).
+ *   change removed or hid (`noteFocusWithin`, `moveFocusLeftBehind`), which
+ *   can lend the target a temporary tab stop (`focusForLastInputTemporarily`).
  * @position Utility; used by overlays (BottomSheet, Dialog, DropdownMenu) that
  *   move focus programmatically, and by disclosures that hide focused
- *   content. isFocusDetached lives in isFocusDetached.ts, so the utils entry,
+ *   content or remove a focused command. isFocusDetached lives in isFocusDetached.ts, so the utils entry,
  *   which exports only it, does not reach this module.
  */
 
@@ -63,12 +64,16 @@ export function noteFocusWithin(
  * browser is about to blur. Focus that survived the change, or that was never
  * inside, is not moved. The ring follows the last input, so the calling
  * component keeps modality tracking active
- * (`useInteractionModalityTracking()`). Returns whether focus moved. Internal.
+ * (`useInteractionModalityTracking()`). `options.preventScroll` keeps the page
+ * still, and `options.temporaryTabStop` lets a target with no tab stop take
+ * focus until it loses it (`focusForLastInputTemporarily`). Returns whether
+ * focus moved. Internal.
  */
 export function moveFocusLeftBehind(
   note: FocusWithin | null,
   target: HTMLElement | null | undefined,
   hidden: Element | null = null,
+  options?: {preventScroll?: boolean; temporaryTabStop?: boolean},
 ): boolean {
   if (
     note == null ||
@@ -77,7 +82,14 @@ export function moveFocusLeftBehind(
   ) {
     return false;
   }
-  focusForLastInput(target);
+  const focusOptions = options?.preventScroll
+    ? {preventScroll: true}
+    : undefined;
+  if (options?.temporaryTabStop) {
+    focusForLastInputTemporarily(target, focusOptions);
+  } else {
+    focusForLastInput(target, focusOptions);
+  }
   return true;
 }
 
@@ -128,6 +140,44 @@ export function focusForLastInput(
     element.blur();
   }
   element.focus({...options, focusVisible: false});
+}
+
+/**
+ * Focuses `element` like `focusForLastInput`, and gives an element that has
+ * no tab stop a temporary `tabindex="-1"` so that it can take focus. The
+ * attribute goes away when the element loses focus or when the caller calls
+ * the returned function. An element that is already focusable, or has its
+ * own `tabindex`, is focused as is, and the returned function does nothing.
+ * Internal.
+ */
+export function focusForLastInputTemporarily(
+  element: HTMLElement,
+  options?: FocusOptions,
+): () => void {
+  if (element.hasAttribute('tabindex') || element.tabIndex >= 0) {
+    focusForLastInput(element, options);
+    return () => {};
+  }
+  element.setAttribute('tabindex', '-1');
+  let isReleased = false;
+  const release = () => {
+    if (isReleased) {
+      return;
+    }
+    isReleased = true;
+    element.removeEventListener('blur', release);
+    if (element.getAttribute('tabindex') === '-1') {
+      element.removeAttribute('tabindex');
+    }
+  };
+  focusForLastInput(element, options);
+  // A pointer-modality focus can blur first; listen only once focus is here.
+  if (element.ownerDocument.activeElement === element) {
+    element.addEventListener('blur', release, {once: true});
+  } else {
+    release();
+  }
+  return release;
 }
 
 /**
