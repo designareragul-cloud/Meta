@@ -716,17 +716,26 @@ describe('usePowerSearchSource', () => {
                   isArbitraryStringAllowed: true,
                 },
               },
+              {
+                key: 'is-any',
+                label: 'is-any',
+                // No flag, so only the `string_list` clause skips this
+                // operator: it pins that clause the way `is` pins the
+                // `string`-type clause.
+                value: {type: 'string_list', searchSource: ownerSource},
+              },
             ],
           },
         ],
       };
       const labels = syncSearch(createSource(config), 'nest').map(r => r.label);
       // Committing 'Owner is "nest"' would offer a value the Owner editor
-      // never lists, so the closed operator stays out; the open list
+      // never lists, so the closed operators stay out; the open list
       // operator and the plain Title operators still match.
       expect(labels).toContain('Title contains "nest"');
       expect(labels).toContain('Owner is-either "nest"');
       expect(labels.some(l => l.startsWith('Owner is '))).toBe(false);
+      expect(labels.some(l => l.startsWith('Owner is-any '))).toBe(false);
     });
 
     it('leaves field-prefixed queries to the exact value path', () => {
