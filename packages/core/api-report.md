@@ -5500,6 +5500,7 @@ interface TablePlugin<T extends Record<string, unknown> = Record<string, unknown
   transformTable?: (props: TableRenderProps) => TableRenderProps
   transformTableContext?: (children: ReactNode) => ReactNode
   usesCanonicalRowKey?: boolean @internal
+  wholeRowOwner?: 'activation' | 'expansion' | 'navigation'
 interface TableProps<T extends Record<string, unknown>> extends TableAppearanceProps<T>
   children?: ReactNode
   columns?: TableColumn<T>[]
