@@ -834,6 +834,7 @@
     "/templates/useToastHookUsage/",
     "/templates/useTranslatorHookUsage/",
     "/templates/useTreeFocusHookUsage/",
+    "/templates/useTruncationHookUsage/",
     "/templates/useTypeaheadHookUsage/",
     "/templates/work-item-detail/",
     "/themes/",
