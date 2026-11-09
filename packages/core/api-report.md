@@ -2484,6 +2484,8 @@ component TextInput(props: TextInputProps)
   prop isRequired?: boolean = false
   prop label: string
   prop labelTooltip?: string
+  prop maxLength?: number
+  prop minLength?: number
   prop onChange?: (value: string, e: ChangeEvent<HTMLInputElement>) => void
   prop onEnter?: () => void
   prop onKeyDown?: (e: KeyboardEvent<HTMLInputElement>) => void
