@@ -901,7 +901,7 @@ component DateInput(props: DateInputProps)
   prop size?: DateInputSize = 'md'
   prop status?: InputStatus
   prop statusVariant?: FieldStatusPlacement = 'attached'
-  prop value?: ISODateString
+  prop value?: ISODateString | undefined
   prop weekStartsOn?: DayOfWeek | DayOfWeekName = 0
   prop width?: SizeValue
   inherits AriaAttributes, DOMAttributes, HTMLAttributes
@@ -977,7 +977,7 @@ component DateTimeInput(props: DateTimeInputProps)
   prop timeLabel?: string
   prop timeOptionInterval?: DateTimeInputTimeOptionInterval
   prop timePlaceholder?: string = "Select a time"
-  prop value?: ISODateTimeString
+  prop value?: ISODateTimeString | undefined
   prop weekStartsOn?: DayOfWeek | DayOfWeekName = 0
   prop width?: SizeValue
   inherits AriaAttributes, DOMAttributes, HTMLAttributes
@@ -2546,7 +2546,7 @@ component TimeInput(props: TimeInputProps)
   prop size?: TimeInputSize = 'md'
   prop status?: InputStatus
   prop statusVariant?: FieldStatusPlacement = 'attached'
-  prop value?: ISOTimeString
+  prop value?: ISOTimeString | undefined
   prop width?: SizeValue
   inherits AriaAttributes, DOMAttributes, HTMLAttributes
 component Timer(props: TimerProps)
@@ -2952,7 +2952,7 @@ hook useResizable
   overload <const Config extends UseResizableSingleConfig>(config: SingleResizableArgument<Config>) => ResizableRegion
   overload <const Config extends UseResizableMultiConfig>(config: MultiResizableArgument<Config>) => Record<string, ResizableRegion>
 hook useScrollLock: (isLocked: boolean) => void
-hook useScrollOverflow: () => { overflowStart: boolean; overflowEnd: boolean; hasOverflow: boolean; scrollRef: (el: HTMLElement | null) => void }
+hook useScrollOverflow: () => { scrollRef: (el: HTMLElement | null) => void; overflowStart: boolean; overflowEnd: boolean; hasOverflow: boolean }
 hook useScrollableArea: ({…}: UseScrollableAreaOptions) => UseScrollableAreaResult
 hook useSelectedItemOffset: ({…}: UseSelectedItemOffsetOptions) => UseSelectedItemOffsetResult
 hook useSideNavCollapse: () => SideNavCollapseState
@@ -2964,6 +2964,7 @@ hook useStepperContext: () => StepperContextValue
 hook useStreamingText: (targetText: string, isStreaming: boolean, options?: UseStreamingTextOptions) => string
 hook useSyntaxTheme: () => UseSyntaxThemeReturn | null
 hook useTabListContext: () => TabListContextValue
+hook useTableActivation: <T extends Record<string, unknown>>(config: UseTableActivationConfig<T>) => TablePlugin<T>
 hook useTableColumnResize: <T extends Record<string, unknown>>(config: UseTableColumnResizeConfig) => TablePlugin<T>
 hook useTableColumnSettings: <T extends Record<string, unknown>, TColumnKey extends string = string>(config: UseTableColumnSettingsConfig<TColumnKey>) => TablePlugin<T>
 hook useTableColumnSettingsState: <TColumnKey extends string = string>(config: UseTableColumnSettingsStateConfig<TColumnKey>) => UseTableColumnSettingsStateReturn<TColumnKey>
@@ -3993,6 +3994,16 @@ interface ComplexSelectorStatus
   message?: string
   type: 'warning' | 'error' | 'success'
 type ComplexSelectorVariant = 'input' | 'secondary' | 'ghost'
+type ComponentIconMap<Variant extends string = IconVariant> = { [Slot in ComponentIconSlotName]?: ComponentIconSlotMap[Slot] extends true ? IconName | null | ComponentIconRequest<Variant> : ComponentIconValue<ComponentIconSlotMap[Slot], Variant> }
+type ComponentIconRequest<Variant extends string = IconVariant> = Readonly<{ icon?: IconName | null; variant?: Variant; size?: IconSize }>
+interface ComponentIconSlotMap
+  code-block-copy: { readonly copied: boolean }
+  table-row-expand: { readonly expanded: boolean }
+  table-sort-indicator: { readonly direction: 'ascending' | 'descending' | 'none' }
+  timestamp-copy: { readonly copied: boolean }
+type ComponentIconSlotName = keyof ComponentIconSlotMap & string
+type ComponentIconStaticMap = Partial<Record<ComponentIconSlotName, IconName | null | ComponentIconRequest<string>>>
+type ComponentIconValue<State, Variant extends string = IconVariant> = IconName | null | ComponentIconRequest<Variant> | ((state: Readonly<State>) => ComponentIconRequest<Variant> | null | undefined)
 type ComponentStyleMap = Record<string, Record<string, StyleOverrides>>
 type ContainerComponent = keyof typeof themeDefaultStyles
 interface ContainerOptions
@@ -4183,6 +4194,7 @@ type DayOfWeekName = 'sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat'
 interface DefineThemeInput<IconVariants extends ReadonlyArray<string> | undefined = ReadonlyArray<string> | undefined, Base extends DefinedTheme | undefined = DefinedTheme | undefined>
   adaptations?: ThemeAdaptations
   color?: ColorScaleConfig
+  componentIcons?: ComponentIconMap<ThemeIconEntryVariant<IconVariants, Base>>
   components?: ComponentStyleMap
   extends?: Base
   iconVariants?: IconVariants
@@ -4202,6 +4214,7 @@ interface DefinedTheme
   __adaptations?: NormalizedThemeAdaptations @internal
   __axes?: ThemeGenerativeAxes @internal
   __built?: true
+  __componentIcons?: Partial<Record<string, StoredComponentIconValue>> @internal
   __iconEntryVariants?: Record<string, ReadonlyArray<string> | undefined> @internal
   __icons?: ThemeIconEntries<never> @internal
   __inputTokens?: Partial<Record<string, TokenValue>> @internal
@@ -4209,6 +4222,7 @@ interface DefinedTheme
   __localTokenOwners?: Record<string, string> @internal
   __onDark?: ResolvedOnMedia @internal
   __onLight?: ResolvedOnMedia @internal
+  componentIcons?: ComponentIconStaticMap
   components?: ComponentStyleMap
   iconVariants?: ReadonlyArray<string>
   icons?: ThemeIconOverrides
@@ -5485,6 +5499,8 @@ interface TablePlugin<T extends Record<string, unknown> = Record<string, unknown
   transformScrollWrapper?: (props: ScrollWrapperRenderProps, context?: TableRenderContext) => ScrollWrapperRenderProps
   transformTable?: (props: TableRenderProps) => TableRenderProps
   transformTableContext?: (children: ReactNode) => ReactNode
+  usesCanonicalRowKey?: boolean @internal
+  wholeRowOwner?: 'activation' | 'expansion' | 'navigation'
 interface TableProps<T extends Record<string, unknown>> extends TableAppearanceProps<T>
   children?: ReactNode
   columns?: TableColumn<T>[]
@@ -6196,6 +6212,10 @@ interface UseSyntaxThemeReturn
   name: string
   token: (name: SyntaxThemeTokenKey) => string
   tokens: Record<SyntaxThemeTokenKey, string>
+interface UseTableActivationConfig<T extends Record<string, unknown>>
+  activeKey: string | number | null
+  getIsItemActivatable?: (item: T) => boolean = all rows activatable
+  onActivate: (item: T, key: string | number) => void
 interface UseTableColumnResizeConfig
   columnWidths?: Record<string, number>
   columns?: TableColumn<Record<string, unknown>>[]
@@ -6259,7 +6279,7 @@ interface UseTableRowExpansionConfig<T extends Record<string, unknown>>
   panelVariant?: 'muted' | 'transparent' = 'transparent'
   renderExpanded: (item: T) => ReactNode
 interface UseTableRowIndexConfig<T extends Record<string, unknown>>
-  data: T[]
+  data?: T[]
   getRowKey?: (item: T) => string
   label?: ReactNode = '#'
   startFrom?: number = 1
@@ -6279,7 +6299,7 @@ interface UseTableSelectionConfig<T extends Record<string, unknown>>
   onSelectAll: (event: { isAllSelected: boolean }) => void
   onSelectItem: (event: { item: T; isSelected: boolean }) => void
 interface UseTableSelectionStateConfig<T extends Record<string, unknown>>
-  data?: T[]
+  data: T[]
   getIsItemEnabled?: (item: T) => boolean = () => true
   getIsItemSelectable?: (item: T) => boolean = () => true
   idKey: (keyof T & string) | ((item: T) => string)
@@ -7206,6 +7226,12 @@ useHoverCard (.)
 ### Also exported from an earlier entry point
 
 ```text
+ComponentIconMap (.)
+ComponentIconRequest (.)
+ComponentIconSlotMap (.)
+ComponentIconSlotName (.)
+ComponentIconStaticMap (.)
+ComponentIconValue (.)
 ExtendedIconName (.)
 Icon (.)
 IconColor (.)
@@ -8766,6 +8792,7 @@ TableTextOverflow (.)
 TableTreeRowMeta (.)
 TableVerticalAlign (.)
 TableVirtualizationCapability (.)
+UseTableActivationConfig (.)
 UseTableColumnResizeConfig (.)
 UseTableColumnSettingsConfig (.)
 UseTableColumnSettingsStateConfig (.)
@@ -8796,6 +8823,7 @@ resolveColumnWidths (.)
 resolveContextActions (.)
 toSearchFilters (.)
 useBaseTablePlugins (.)
+useTableActivation (.)
 useTableColumnResize (.)
 useTableColumnSettings (.)
 useTableColumnSettingsState (.)
@@ -10354,7 +10382,7 @@ target checkbox-label (CheckboxInput)
 target checkbox-list (CheckboxList)
 target citation (Citation) props [variant]
 target clickable-card (ClickableCard) props [variant]
-target code (Code) props [color]
+target code (Code) props [color, size]
 target code-block (CodeBlock) props [container, language, size]
 target code-block-copy-button (CodeBlock)
 target code-block-header (CodeBlock) props [container, language, size]
@@ -10427,7 +10455,7 @@ target input-clear-icon (Field)
 target input-group (InputGroup) props [size, status]
 target input-group-text (InputGroup)
 target input-status-icon (Field) props [size, status]
-target item (Item) props [align, density]
+target item (Item) props [align, density] states [disabled, highlighted, selected]
 target item-swipe-action (Item) props [variant]
 target item-swipe-panel (Item) props [side]
 target kbd (Kbd)
@@ -10602,14 +10630,14 @@ attr data-columns (theme reflection on 2 targets)
 attr data-container (theme reflection on 5 targets)
 attr data-density (theme reflection on 25 targets)
 attr data-direction (theme reflection on 3 targets)
-attr data-disabled (theme reflection on 30 targets)
+attr data-disabled (theme reflection on 31 targets)
 attr data-divided (theme reflection on 1 target)
 attr data-edge-fade (theme reflection on 1 target)
 attr data-elevation (theme reflection on 5 targets)
 attr data-format (theme reflection on 1 target)
 attr data-gap (theme reflection on 3 targets)
 attr data-height (theme reflection on 1 target)
-attr data-highlighted (theme reflection on 1 target)
+attr data-highlighted (theme reflection on 2 targets)
 attr data-in-range (theme reflection on 1 target)
 attr data-indicator-position (theme reflection on 1 target)
 attr data-is-pressed (theme reflection on 1 target)
@@ -10632,12 +10660,12 @@ attr data-presentation (theme reflection on 1 target)
 attr data-progress (theme reflection on 4 targets)
 attr data-readonly (theme reflection on 5 targets)
 attr data-select-all (theme reflection on 1 target)
-attr data-selected (theme reflection on 14 targets)
+attr data-selected (theme reflection on 15 targets)
 attr data-sender (theme reflection on 2 targets)
 attr data-shade (theme reflection on 1 target)
 attr data-shape (theme reflection on 5 targets)
 attr data-side (theme reflection on 3 targets)
-attr data-size (theme reflection on 55 targets)
+attr data-size (theme reflection on 56 targets)
 attr data-snap (theme reflection on 1 target)
 attr data-state (theme reflection on 7 targets)
 attr data-status (theme reflection on 24 targets)
