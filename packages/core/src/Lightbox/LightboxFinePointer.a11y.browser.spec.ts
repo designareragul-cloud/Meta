@@ -244,9 +244,11 @@ test('the zoom target takes its touches as on a phone where the primary pointer 
   expect(await stage.evaluate(el => getComputedStyle(el).touchAction)).toBe(
     'none',
   );
+  // The last is the media surface, which has no box.
   expect(await touchActionsAbove(img)).toEqual([
     'auto',
     'none',
+    'auto',
     'auto',
     'auto',
   ]);
@@ -271,7 +273,9 @@ test('a photo without zoom leaves its touches to the page where the primary poin
   const dialog = page.getByRole('dialog');
   await expect(dialog).toBeVisible();
   const photo = dialog.getByRole('img').first();
+  // The last is the media surface, which has no box.
   expect(await touchActionsAbove(photo)).toEqual([
+    'auto',
     'auto',
     'auto',
     'auto',
@@ -287,11 +291,13 @@ test('a gallery leaves its sideways touches to the page where the primary pointe
   // page's pinch-zoom. The drag paging is the touch presentation's, so the
   // pager's viewport claims no pan.
   const {current} = await openGallery(page);
+  // The last is the media surface, which has no box.
   expect(await touchActionsAbove(current)).toEqual([
     'auto',
     'none',
     'auto',
     'pinch-zoom',
+    'auto',
     'auto',
     'auto',
     'auto',

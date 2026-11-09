@@ -27,6 +27,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useReducer,
   useRef,
@@ -36,6 +37,7 @@ import {
   type ComponentProps,
   type ReactNode,
 } from 'react';
+import {flushSync} from 'react-dom';
 import * as stylex from '@stylexjs/stylex';
 import type {StyleXStyles} from '@stylexjs/stylex';
 import {
@@ -52,6 +54,11 @@ import {useScrollLock} from '../hooks/useScrollLock';
 import {useIsomorphicLayoutEffect} from '../hooks/useIsomorphicLayoutEffect';
 import {useAttachment} from '../hooks/useAttachment';
 import {observeResize} from '../utils/sharedResizeObserver';
+import {observeContent} from '../utils/sharedMutationObserver';
+import {MIN_TOUCH_TARGET} from '../utils/hitArea';
+import {useTouchHitArea, type TouchHitAreaOptions} from '../utils/touchHitArea';
+import {touchHitAreaStyles} from '../internal/touchHitArea.stylex';
+import {usePressTracker} from '../gestures/usePressTracker';
 import {mergeProps, rtlStyles} from '../utils';
 import type {BaseProps} from '../BaseProps';
 import {themeProps} from '../utils/themeProps';
@@ -84,9 +91,21 @@ import {
 } from '../i18n/useComponentTranslator';
 import english from '../i18n/generated-english/Lightbox/Lightbox.generated';
 import {isRenderable} from '../utils/isRenderable';
-import {prepareFocusReturnOnRemoval} from '../utils/focusReturn';
+import {
+  focusForLastInput,
+  moveFocusLeftBehind,
+  noteFocusWithin,
+  prepareFocusReturnOnRemoval,
+  returnFocusForLastInput,
+  type FocusWithin,
+} from '../utils/focusReturn';
 import {animatorFor, type Animator} from '../motion/animator';
 import {dismissBackdropAlpha, dismissChromeAlpha} from './zoomStage';
+import {useInteractionModalityTracking} from '../utils/interactionModality';
+import {MediaTheme} from '../theme/MediaTheme';
+import {Text} from '../Text/Text';
+import {useHeldTruncation} from '../Text/useTruncation';
+import {Link} from '../Link/Link';
 
 registerEnglishFallback(english);
 /**
@@ -167,6 +186,28 @@ export interface LightboxProps extends BaseProps<HTMLDialogElement> {
 /** Set on the stage while a mouse or a pen hovers over the fitted photo. */
 const OVER_PHOTO_ATTRIBUTE = 'data-lightbox-over-photo';
 
+// The caption's backing: the controls' backing colour, darker, so the caption
+// keeps 4.5:1 over any photo or backdrop behind it (WCAG 2.2 1.4.3).
+const CAPTION_BACKING = `color-mix(in srgb, ${colorVars['--color-on-light']} 90%, transparent)`;
+
+/**
+ * The caption toggle's touch target grows toward 44 px down and to each
+ * side, never up: the line above is the caption's own text.
+ */
+const CAPTION_TOGGLE_HIT_AREA: TouchHitAreaOptions = {
+  growth: target => {
+    const x = Math.max(
+      0,
+      (MIN_TOUCH_TARGET - (target.right - target.left)) / 2,
+    );
+    const y = Math.max(
+      0,
+      (MIN_TOUCH_TARGET - (target.bottom - target.top)) / 2,
+    );
+    return {top: 0, right: x, bottom: y, left: x};
+  },
+};
+
 const styles = stylex.create({
   dialog: {
     position: 'fixed',
@@ -228,8 +269,8 @@ const styles = stylex.create({
     flexShrink: 1,
     flexBasis: 0,
   },
-  // The filling stage's group clips, so its focus ring sits inside its edge.
-  imageWrapperFocusInset: {
+  // The zoom button's box clips, so its focus ring sits inside its edge.
+  zoomButtonFocusInset: {
     outlineOffset: {
       default: '0',
       ':focus-visible': `calc(-1 * ${focusVars['--focus-outline-width']})`,
@@ -268,14 +309,8 @@ const styles = stylex.create({
   trackZoomTarget: {
     touchAction: 'pinch-zoom',
   },
-  // A zoomable page's photo box fills the page above its caption, as a
-  // single item's stage does.
   pageMediaZoomTarget: {
     touchAction: 'none',
-    alignSelf: 'stretch',
-    flexGrow: 1,
-    flexShrink: 1,
-    flexBasis: 0,
   },
   // In the touch presentation, a photo without zoom leaves pinch-zoom to the
   // page but takes one-finger drags. A drag down dismisses it.
@@ -296,43 +331,168 @@ const styles = stylex.create({
     flexBasis: 0,
     position: 'relative',
   },
-  // The pages stack in the track's one cell, each offset by its relative
-  // inset.
+  // Two rows that every page shares through subgrid: the photo's and the
+  // caption band's. The band has one height on every page (`captionBand`). So
+  // every photo centres on the same box, with or without a caption. The next
+  // photo slides in level with the current one, and paging never resizes it.
   track: {
     position: 'absolute',
     inset: 0,
     display: 'grid',
     gridTemplateColumns: '100%',
-    gridTemplateRows: '100%',
+    gridTemplateRows: 'minmax(0, 1fr) auto',
   },
-  // One page per item, the stage's size, at index × (width + gap). A page
-  // lays out its photo and caption as a single item does: the caption right
-  // under the photo, and the pair centred. Each page has its own layer.
-  // Through a busy main thread, Mobile Safari moves the track but cannot
-  // paint what it had not painted. So a page that slides in must be painted
-  // whole before it moves.
+  // One page per item, the stage's size, at index × (width + gap). The pages
+  // stack in the track's one column, offset by their relative inset. Each has
+  // its own layer. Through a busy main thread, Mobile Safari moves the track
+  // but cannot paint what it had not painted. So a page that slides in must be
+  // painted whole before it moves.
   page: {
     position: 'relative',
-    gridArea: '1 / 1',
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'center',
+    gridColumn: '1',
+    gridRow: '1 / span 2',
+    display: 'grid',
+    gridTemplateColumns: '100%',
+    gridTemplateRows: 'subgrid',
     minHeight: 0,
-    minWidth: 0,
     willChange: 'transform',
   },
-  // A page's photo box: the zoom stage of the current page.
+  // A page's photo box: the zoom stage of the current page, in the photo
+  // row. Its caption sits in the caption band below it, so the viewer's size
+  // never changes with the item.
   pageMedia: {
+    gridRow: '1',
+    minHeight: 0,
+    minWidth: 0,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     // As the single item's stage, while a photo is dragged to dismiss.
     overflow: {default: 'hidden', ':is([data-zoom-dismissing])': 'visible'},
     zIndex: {default: null, ':is([data-zoom-dismissing])': 1},
-    minHeight: 0,
+  },
+  // A gallery's caption band, under every page's photo. It is two caption
+  // lines tall whatever the caption, so the photo area stays the same. Its
+  // lines are the caption's own type, on the caption's backing. Its padding
+  // clears the screen's bottom edge and the safe area there.
+  captionBand: {
+    gridRow: '2',
+    position: 'relative',
+    display: 'flex',
+    justifyContent: 'center',
+    alignItems: 'flex-start',
+    minWidth: 0,
+    boxSizing: 'content-box',
+    // The caption Text's type, so `2lh` is two caption lines.
+    // SYNC: the caption Text's `type` in this file.
+    fontSize: typeScaleVars['--text-body-size'],
+    lineHeight: typeScaleVars['--text-body-leading'],
+    blockSize: `calc(${spacingVars['--spacing-2']} + 2lh)`,
+    paddingBlockEnd: `calc(${spacingVars['--spacing-3']} + env(safe-area-inset-bottom, 0px))`,
+    backgroundColor: CAPTION_BACKING,
+  },
+  // The band under an open caption, which brings its own backing.
+  captionBandUnderOpen: {
+    backgroundColor: 'transparent',
+  },
+  // A page with no caption keeps the band's space, so its photo sits where
+  // every other page's does. It shows no backing there.
+  captionBandBare: {
+    backgroundColor: 'transparent',
+  },
+  captionInBand: {
+    display: 'flex',
     minWidth: 0,
     maxWidth: '100%',
+  },
+  // The caption's Text and its toggle. The toggle is out of the flow, so the
+  // Text takes the whole width.
+  captionBody: {
+    position: 'relative',
+    display: 'flex',
+    alignItems: 'flex-start',
+    minWidth: 0,
+    maxWidth: '100%',
+  },
+  // Lets the clamped Text shrink inside the band.
+  captionClamped: {
+    flexShrink: 1,
+    minWidth: 0,
+  },
+  // The caption's lines in one block, so the clamp counts them and the floats
+  // in it wrap them. Every state renders it, with or without a toggle.
+  captionFlow: {
+    display: 'block',
+  },
+  // Physical floats: StyleX keys `inline-end` on the page's direction. So a
+  // right-to-left caption flips them, as the toggle follows its own.
+  // A zero-width float as tall as every shown line but the last. It pushes
+  // the toggle's place down to the last line. Without a toggle it has no
+  // height.
+  captionToggleSpacer: {
+    float: {
+      default: 'right',
+      ':is([dir="rtl"] *)': 'left',
+    },
+    inlineSize: 0,
+  },
+  captionToggleSpacerHeight: (height: number) => ({
+    blockSize: height,
+  }),
+  // The toggle's place at the end of the caption's last line. The text wraps
+  // around it, so the clamp's ellipsis comes just before the toggle. Without
+  // a toggle it has no size, so it moves no line.
+  captionTogglePlace: {
+    float: {
+      default: 'right',
+      ':is([dir="rtl"] *)': 'left',
+    },
+    clear: {
+      default: 'right',
+      ':is([dir="rtl"] *)': 'left',
+    },
+  },
+  captionTogglePlaceShown: (width: number) => ({
+    inlineSize: width,
+    blockSize: '1lh',
+    marginInlineStart: spacingVars['--spacing-1'],
+  }),
+  // The caption's link over its place: the caption's last line, inside the
+  // Text's inline padding. It takes the caption's font and line height, so
+  // it sits on that line as its text does.
+  // SYNC: `caption`'s paddingInline.
+  captionToggle: {
+    position: 'absolute',
+    insetInlineEnd: spacingVars['--spacing-3'],
+    insetBlockEnd: 0,
+  },
+  // The toggle's own display wins over `hidden`'s, so this hides it.
+  captionToggleHidden: {
+    display: 'none',
+  },
+  // An open caption that scrolls keeps its toggle's width clear at every
+  // line's end. The toggle stays in view as the lines move.
+  captionTextBesideToggle: (width: number) => ({
+    paddingInlineEnd: `calc(${spacingVars['--spacing-3']} + ${width}px + ${spacingVars['--spacing-1']})`,
+  }),
+  // The open caption: the same element, out of the band and over the
+  // photo's bottom, on the controls' scrim. Its last line and the toggle stay
+  // where they were, and it grows upward.
+  captionOpen: {
+    position: 'absolute',
+    insetInline: 0,
+    insetBlockEnd: 0,
+    justifyContent: 'center',
+    maxWidth: 'none',
+    paddingBlockEnd: `calc(${spacingVars['--spacing-3']} + env(safe-area-inset-bottom, 0px))`,
+    backgroundColor: CAPTION_BACKING,
+  },
+  // The open caption's text, up to 60 % of the viewport tall. A finger
+  // scrolls a longer one, and the toggle stays in view beside it.
+  captionTextOpen: {
+    maxBlockSize: `calc(60dvh - ${spacingVars['--spacing-3']} - env(safe-area-inset-bottom, 0px))`,
+    overflowY: 'auto',
+    touchAction: 'pan-y',
   },
   // A fitted photo's zoom-in cursor shows only over the photo, where the
   // stage sets OVER_PHOTO_ATTRIBUTE. Beside it, a click closes the viewer.
@@ -366,11 +526,9 @@ const styles = stylex.create({
     objectFit: 'contain',
     outline: 'none',
   },
+  // The caption's box. Its type and color are the caption Text's, and both of
+  // its lines start at one edge.
   caption: {
-    color: colorVars['--color-on-dark'],
-    fontSize: typeScaleVars['--text-large-size'],
-    lineHeight: typeScaleVars['--text-large-leading'],
-    textAlign: 'center',
     paddingBlockStart: spacingVars['--spacing-2'],
     paddingBlockEnd: 0,
     paddingInline: spacingVars['--spacing-3'],
@@ -405,14 +563,10 @@ const styles = stylex.create({
     position: 'absolute',
     top: spacingVars['--spacing-3'],
     insetInlineStart: spacingVars['--spacing-3'],
-    color: colorVars['--color-on-dark'],
-    fontSize: typeScaleVars['--text-body-size'],
-    lineHeight: typeScaleVars['--text-body-leading'],
     zIndex: 1,
     pointerEvents: 'auto',
   },
   controlButton: {
-    color: colorVars['--color-on-dark'],
     pointerEvents: 'auto',
   },
   // The controls sit in layers over the viewer that pass clicks through. A
@@ -436,13 +590,18 @@ const styles = stylex.create({
     backgroundColor: `color-mix(in srgb, ${colorVars['--color-on-light']} 75%, transparent)`,
     borderRadius: radiusVars['--radius-full'],
   },
-  controlIcon: {
-    color: colorVars['--color-on-dark'],
-  },
   counterBacking: {
     backgroundColor: `color-mix(in srgb, ${colorVars['--color-on-light']} 75%, transparent)`,
     borderRadius: radiusVars['--radius-full'],
     paddingInline: spacingVars['--spacing-2'],
+  },
+  // With zoom, the icons and the Counter's text keep the on-dark colour on
+  // the backing, whatever a theme does to the buttons or to Text.
+  controlIcon: {
+    color: colorVars['--color-on-dark'],
+  },
+  counterOnDark: {
+    color: colorVars['--color-on-dark'],
   },
 });
 
@@ -468,6 +627,31 @@ const KEYBOARD_PAN_OFFSETS: Record<string, [number, number]> = {
 
 /** The height of a video's native controls, px: no browser reports it. */
 const VIDEO_CONTROLS_BAND = 48;
+
+/**
+ * Calls `onDelivery` with each entry of the shared ResizeObserver for
+ * `element`. It skips the call that registers it, which runs in React's
+ * commit, where a read forces a layout before the browser's own. The first
+ * delivery comes after the browser lays `element` out. Where no
+ * ResizeObserver exists (jsdom), it returns null and the caller measures at
+ * once.
+ */
+function observeAfterLayout(
+  element: Element,
+  onDelivery: (entry: ResizeObserverEntry) => void,
+): (() => void) | null {
+  if (typeof ResizeObserver === 'undefined') {
+    return null;
+  }
+  let isRegistered = false;
+  const stop = observeResize(element, entry => {
+    if (isRegistered) {
+      onDelivery(entry);
+    }
+  });
+  isRegistered = true;
+  return stop;
+}
 
 /**
  * A fullscreen overlay for viewing images at full resolution.
@@ -529,7 +713,10 @@ export function Lightbox({
 }: LightboxProps) {
   const t = useComponentTranslator();
   const dialogRef = useRef<HTMLDialogElement>(null);
-  const mergedDialogRef = useMergedRefs(ref, dialogRef);
+  // The last input in the viewer's own document, a Picture-in-Picture window's
+  // too, decides whether focus the viewer moves shows a ring.
+  const {ref: modalityRef} = useInteractionModalityTracking();
+  const mergedDialogRef = useMergedRefs(ref, dialogRef, modalityRef);
   // Native showModal() lets Tab leave for the browser's own UI, so the shared
   // module wraps it.
   useFocusRegionContainment(dialogRef, isOpen);
@@ -682,10 +869,17 @@ export function Lightbox({
     if (isOpen && !dialog.open) {
       triggerElementRef.current = document.activeElement;
       dialog.showModal();
+      // The browser focuses the viewer's first control as it opens. Its ring
+      // follows the last input, so a tap or a click shows none.
+      const view = dialog.ownerDocument.defaultView ?? window;
+      const focused = dialog.ownerDocument.activeElement;
+      if (focused instanceof view.HTMLElement && dialog.contains(focused)) {
+        focusForLastInput(focused);
+      }
     } else if (!isOpen && dialog.open) {
       dialog.close();
       if (triggerElementRef.current instanceof HTMLElement) {
-        triggerElementRef.current.focus();
+        returnFocusForLastInput(triggerElementRef.current);
       }
     }
   }, [isOpen, hasItem]);
@@ -758,7 +952,179 @@ export function Lightbox({
   // clears the flag, and a finger's only on the stage.
   const didDragRef = useRef(false);
   const mediaGroupRef = useRef<HTMLDivElement | null>(null);
-  const captionRef = useRef<HTMLDivElement | null>(null);
+  const captionRef = useRef<HTMLElement | null>(null);
+  // The current item's caption, which is the viewer's accessible description.
+  const captionId = useId();
+  const fullCaptionId = useId();
+  // The item whose full caption is open over its photo. Paging closes it.
+  const [openCaptionIndex, setOpenCaptionIndex] = useState<number | null>(null);
+  if (openCaptionIndex != null && openCaptionIndex !== index) {
+    setOpenCaptionIndex(null);
+  }
+  const isCaptionOpen = openCaptionIndex === index;
+  // The toggle's width, which its place in the caption's last line takes.
+  const [captionToggleWidth, setCaptionToggleWidth] = useState(0);
+  // The current page's caption in its band, and whether two lines clamp it.
+  // Text's truncation check also follows new text in a box that keeps its
+  // size. While the caption is open it holds its closed answer, so the toggle
+  // stays mounted, with its focus, as the caption closes.
+  const bandCaptionRef = useRef<HTMLElement | null>(null);
+  const captionTruncation = useHeldTruncation({
+    maxLines: 2,
+    isHeld: isCaptionOpen,
+  });
+  const isCaptionClamped = captionTruncation.isTruncated;
+  const measureCaptionClamp = captionTruncation.measure;
+  const bandCaptionMeasureRef = useMergedRefs(
+    bandCaptionRef,
+    captionTruncation.ref,
+  );
+  // How far below the caption's first line its last shown line starts.
+  const [captionLastLineTop, setCaptionLastLineTop] = useState(0);
+  // Whether the open caption scrolls inside its panel.
+  const [isCaptionScrolling, setIsCaptionScrolling] = useState(false);
+  const measureCaptionLines = useCallback(() => {
+    const caption = bandCaptionRef.current;
+    if (caption != null) {
+      const view = caption.ownerDocument.defaultView ?? window;
+      const style = view.getComputedStyle(caption);
+      const lines =
+        caption.clientHeight -
+        parseFloat(style.paddingTop) -
+        parseFloat(style.paddingBottom);
+      const line = parseFloat(style.lineHeight);
+      setCaptionLastLineTop(
+        Number.isFinite(line) ? Math.max(0, lines - line) : 0,
+      );
+    }
+    setIsCaptionScrolling(
+      isCaptionOpen &&
+        caption != null &&
+        caption.scrollHeight > caption.clientHeight + 1,
+    );
+  }, [isCaptionOpen]);
+  // The caption's reads and its toggle's width wait for one microtask after
+  // the observer's callback. There the caption is read before any write, and
+  // one commit lands before the frame paints. A read after a write in that
+  // delivery would force a layout before the browser's own.
+  const measureCaptionRef = useRef(() => {});
+  // Syncs the measurement with this render's clamp and lines measures.
+  useIsomorphicLayoutEffect(() => {
+    measureCaptionRef.current = () => {
+      measureCaptionClamp();
+      measureCaptionLines();
+    };
+  });
+  const captionDeliveryRef = useRef<{
+    isCaptionDirty: boolean;
+    toggleWidth: number | null;
+  } | null>(null);
+  const noteCaptionDelivery = useCallback(
+    (isCaptionDirty: boolean, toggleWidth: number | null) => {
+      let due = captionDeliveryRef.current;
+      if (due == null) {
+        due = {isCaptionDirty: false, toggleWidth: null};
+        captionDeliveryRef.current = due;
+        queueMicrotask(() => {
+          const pending = captionDeliveryRef.current;
+          captionDeliveryRef.current = null;
+          if (pending == null) {
+            return;
+          }
+          // eslint-disable-next-line @eslint-react/dom-no-flush-sync -- a delivery comes after layout and before paint; the caption's "more" and the toggle's place commit in that frame
+          flushSync(() => {
+            if (pending.isCaptionDirty) {
+              measureCaptionRef.current();
+            }
+            if (pending.toggleWidth != null) {
+              setCaptionToggleWidth(pending.toggleWidth);
+            }
+          });
+        });
+      }
+      due.isCaptionDirty ||= isCaptionDirty;
+      due.toggleWidth = toggleWidth ?? due.toggleWidth;
+    },
+    [],
+  );
+  // Syncs the clamp, the toggle's place and the open caption's scroll with
+  // the caption's laid-out size and its text. A resize, a font load and the
+  // caption's own open resize it. New text can keep its size, and paging
+  // attaches the next page's caption. The dialog's opening attaches it again.
+  // Each registration gets one delivery after the browser lays the caption
+  // out, and the commit reads nothing. A delivery's update changes attributes
+  // and styles only, and adds no element. Another observer that reacts to new
+  // elements then observes nothing mid-delivery. The observer watches the
+  // caption's box, two levels above its text. A delivery can show the toggle,
+  // and the toggle's observers sit deeper, so they get their deliveries in the
+  // same frame.
+  useAttachment(
+    bandCaptionRef,
+    element => {
+      const box = element.closest('[data-lightbox-caption]') ?? element;
+      const register = (): (() => void) | undefined => {
+        const stop = observeAfterLayout(box, () => {
+          noteCaptionDelivery(true, null);
+        });
+        if (stop == null) {
+          measureCaptionRef.current();
+          return undefined;
+        }
+        return stop;
+      };
+      let stopResize = register();
+      // New text in a box that keeps its size fires no resize. A new
+      // registration gets its own delivery after the next layout.
+      const stopContent = observeContent(element, () => {
+        stopResize?.();
+        stopResize = register();
+      });
+      return () => {
+        stopResize?.();
+        stopContent();
+      };
+    },
+    isOpen,
+  );
+  // The caption's toggle. Under a coarse pointer it takes taps out toward
+  // 44 px. A finger's tap on it is its own, as UIKit gives a control's tap
+  // precedence over the single tap of the photo around it.
+  const captionToggleRef = useRef<HTMLButtonElement | null>(null);
+  // Close, where focus goes off a paged-away toggle when the stage takes none.
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  // The current caption's toggle shows while two lines clamp it, or open.
+  const hasCaptionToggle = isCaptionClamped || isCaptionOpen;
+  const captionToggleHitAreaRef = useTouchHitArea(
+    hasCaptionToggle,
+    CAPTION_TOGGLE_HIT_AREA,
+  );
+  const captionToggleRefs = useMergedRefs(
+    captionToggleRef,
+    captionToggleHitAreaRef,
+  );
+  usePressTracker(captionToggleRef);
+  // Syncs the toggle's place in the caption's last line with its width. The
+  // width is the delivery's own size, measured in the layout the delivery
+  // follows, so nothing reads the toggle there. A hidden toggle's size is
+  // zero, so the last width stays until a shown toggle's delivery brings
+  // another.
+  useAttachment(
+    captionToggleRef,
+    toggle => {
+      const stop = observeAfterLayout(toggle, entry => {
+        const width = entry.borderBoxSize?.[0]?.inlineSize ?? 0;
+        if (width > 0) {
+          noteCaptionDelivery(false, Math.round(width));
+        }
+      });
+      if (stop == null) {
+        setCaptionToggleWidth(toggle.offsetWidth);
+        return () => {};
+      }
+      return stop;
+    },
+    null,
+  );
   // Whether a mouse's or a pen's click on the media closes the viewer. It
   // does when its press or its release lands outside the media: a single
   // item's, or a gallery's current page's. The media runs from the fitted
@@ -806,14 +1172,34 @@ export function Lightbox({
     );
     const middle = boxRect.left + box.clientWidth / 2;
     const shown = media.getBoundingClientRect();
-    const isOutside = ({x, y}: {x: number; y: number}) =>
-      (y < top || y > bottom || Math.abs(x - middle) > width / 2) &&
-      !(
+    // A gallery's caption row can sit apart from the photo. There the media is
+    // the photo's rows and the caption's own box. So the band between them,
+    // and the row beside the caption, are outside it.
+    const captionBox =
+      page === viewer ? null : caption?.getBoundingClientRect();
+    const isOutside = ({x, y}: {x: number; y: number}) => {
+      const isOnShownPhoto =
         x >= shown.left &&
         x <= shown.right &&
         y >= shown.top &&
-        y <= shown.bottom
-      );
+        y <= shown.bottom;
+      if (isOnShownPhoto) {
+        return false;
+      }
+      if (captionBox == null) {
+        return y < top || y > bottom || Math.abs(x - middle) > width / 2;
+      }
+      const isOnPhotoRows =
+        y >= top &&
+        y <= top + media.offsetHeight &&
+        Math.abs(x - middle) <= width / 2;
+      const isOnCaption =
+        y >= captionBox.top &&
+        y <= captionBox.bottom &&
+        x >= captionBox.left &&
+        x <= captionBox.right;
+      return !isOnPhotoRows && !isOnCaption;
+    };
     const press = pressPointRef.current;
     return (
       isOutside({x: e.clientX, y: e.clientY}) ||
@@ -852,13 +1238,14 @@ export function Lightbox({
     if (dialog == null || container == null) {
       return {backdrop: null, chrome: []};
     }
+    // A caption in a band fades as the band, which carries its backing.
     const chrome: HTMLElement[] = [];
     for (const element of container.querySelectorAll<HTMLElement>(
-      '[data-lightbox-chrome], [data-lightbox-page]:not([data-current]), [data-lightbox-caption]',
+      '[data-lightbox-chrome], [data-lightbox-page]:not([data-current]), [data-lightbox-caption-band], [data-lightbox-caption]',
     )) {
       if (
         element.parentElement?.closest(
-          '[data-lightbox-page]:not([data-current])',
+          '[data-lightbox-page]:not([data-current]), [data-lightbox-caption-band]',
         ) == null
       ) {
         chrome.push(element);
@@ -881,35 +1268,21 @@ export function Lightbox({
   // Meanwhile the caption goes back to its own place below the stage.
   const isShownAtFitRef = useRef(true);
   const placeCaption = useCallback(() => {
-    // The stage's space below its fitted photo: the photo's laid-out height,
-    // not its zoomed box.
-    const place = (
-      caption: HTMLElement | null,
-      stageElement: HTMLElement | null,
-      isAtFit: boolean,
-    ) => {
-      const photo = stageElement?.querySelector('img');
-      if (caption == null) {
-        return;
-      }
-      const below =
-        isZoomTarget && isAtFit && stageElement != null && photo != null
-          ? (stageElement.clientHeight - photo.offsetHeight) / 2
-          : 0;
-      caption.style.translate = below > 0 ? `0 ${-below}px` : '';
-    };
-    place(captionRef.current, imageWrapperRef.current, isShownAtFitRef.current);
-    // A gallery's pages, each with its own caption under its own photo. Only
-    // the current one can be zoomed.
-    for (const page of trackRef.current?.querySelectorAll<HTMLElement>(
-      ':scope > [data-lightbox-page]',
-    ) ?? []) {
-      place(
-        page.querySelector<HTMLElement>(':scope > [data-lightbox-caption]'),
-        page.querySelector<HTMLElement>(':scope > [data-lightbox-page-media]'),
-        !page.hasAttribute('data-current') || isShownAtFitRef.current,
-      );
+    const caption = captionRef.current;
+    if (caption == null) {
+      return;
     }
+    const stageElement = imageWrapperRef.current;
+    const photo = stageElement?.querySelector('img');
+    // The photo's laid-out height, not its zoomed box.
+    const below =
+      isZoomTarget &&
+      isShownAtFitRef.current &&
+      stageElement != null &&
+      photo != null
+        ? (stageElement.clientHeight - photo.offsetHeight) / 2
+        : 0;
+    caption.style.translate = below > 0 ? `0 ${-below}px` : '';
   }, [isZoomTarget]);
   useAttachment(
     imageWrapperRef,
@@ -1108,6 +1481,28 @@ export function Lightbox({
       touch.startY >= box.bottom - VIDEO_CONTROLS_BAND
     );
   };
+
+  // Paging turns the page that holds focus inert, which drops focus inside
+  // it, such as on its caption toggle or its photo. Such focus moves to the
+  // new page's photo, or to Close without zoom, so the arrow keys keep paging.
+  const pagingFocusRef = useRef<FocusWithin | null>(null);
+  const noteFocusBeforePaging = useCallback(() => {
+    pagingFocusRef.current = noteFocusWithin(
+      imageWrapperRef.current?.querySelector<HTMLElement>('[data-current]'),
+    );
+  }, []);
+  // Effect: syncs DOM focus with the new page, since the browser drops focus
+  // from the page that turned inert.
+  useIsomorphicLayoutEffect(() => {
+    const note = pagingFocusRef.current;
+    pagingFocusRef.current = null;
+    moveFocusLeftBehind(
+      note,
+      isZoomTarget ? pageMediaRef.current : closeButtonRef.current,
+      note?.container,
+    );
+  }, [index, isZoomTarget]);
+
   usePager({
     viewportRef: imageWrapperRef,
     trackRef,
@@ -1131,6 +1526,7 @@ export function Lightbox({
     shouldBeginPan: direction => !stage.isZoomed() || stage.isAtEdge(direction),
     onIndexChange: (next, reason) => {
       if (reason === 'drag') {
+        noteFocusBeforePaging();
         setIndex(next);
       }
     },
@@ -1149,25 +1545,32 @@ export function Lightbox({
     },
   });
 
-  // Whether a point is on the current page's media group: its photo or video
-  // and its caption, as one box. The photo takes no pointer events, so a
-  // press on it lands on its box. An element with no size yet (a photo still
-  // loading) adds nothing to the box.
+  // Whether a point is on the current page's media. That is inside its
+  // caption's own box, or in its photo's or video's rows across the width of
+  // both. So a click beside a narrow photo, within its caption's width, stays
+  // on the media. The band between the photo and the caption row does not.
+  // The photo takes no pointer events, so a press on it lands on its box. An
+  // element with no size yet (a photo still loading) counts for nothing.
   const isOnCurrentMedia = (x: number, y: number) => {
     const page = imageWrapperRef.current?.querySelector('[data-current]');
-    const boxes = [
-      page?.querySelector('img'),
-      page?.querySelector('video'),
-      page?.querySelector('[data-lightbox-caption]'),
-    ]
-      .map(element => element?.getBoundingClientRect())
-      .filter((r): r is DOMRect => r != null && r.width > 0 && r.height > 0);
+    const sized = (element: Element | null | undefined) => {
+      const r = element?.getBoundingClientRect();
+      return r != null && r.width > 0 && r.height > 0 ? r : null;
+    };
+    const media =
+      sized(page?.querySelector('img')) ?? sized(page?.querySelector('video'));
+    const caption = sized(page?.querySelector('[data-lightbox-caption]'));
+    const boxes = [media, caption].filter((r): r is DOMRect => r != null);
+    const inRows = (r: DOMRect | null) =>
+      r != null && y >= r.top && y <= r.bottom;
     return (
-      boxes.length > 0 &&
-      x >= Math.min(...boxes.map(r => r.left)) &&
-      x <= Math.max(...boxes.map(r => r.right)) &&
-      y >= Math.min(...boxes.map(r => r.top)) &&
-      y <= Math.max(...boxes.map(r => r.bottom))
+      (inRows(caption) &&
+        caption != null &&
+        x >= caption.left &&
+        x <= caption.right) ||
+      (inRows(media) &&
+        x >= Math.min(...boxes.map(r => r.left)) &&
+        x <= Math.max(...boxes.map(r => r.right)))
     );
   };
   // Without zoom, a gallery's stage fills the viewer. So a finger's tap on it
@@ -1201,15 +1604,17 @@ export function Lightbox({
 
   const goToPrev = useCallback(() => {
     if (canPrev) {
+      noteFocusBeforePaging();
       setIndex(index - 1);
     }
-  }, [canPrev, index, setIndex]);
+  }, [canPrev, index, noteFocusBeforePaging, setIndex]);
 
   const goToNext = useCallback(() => {
     if (canNext) {
+      noteFocusBeforePaging();
       setIndex(index + 1);
     }
-  }, [canNext, index, setIndex]);
+  }, [canNext, index, noteFocusBeforePaging, setIndex]);
 
   // Keyboard navigation. While zoomed, arrows pan the image (matching common
   // lightbox conventions); when not zoomed they navigate the gallery.
@@ -1253,9 +1658,13 @@ export function Lightbox({
     [isZoomTarget, stage, goToPrev, goToNext],
   );
 
-  // Enter/Space on the focused image wrapper (role="button") toggles zoom.
+  // Enter/Space on the focused zoom button toggles zoom. Keys from a child
+  // stay the child's.
   const handleImageKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.target !== e.currentTarget) {
+        return;
+      }
       if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault();
         stage.toggle();
@@ -1279,12 +1688,14 @@ export function Lightbox({
       isDisabled,
       onClick,
       isMirrored = false,
+      buttonRef,
     }: {
       icon: ComponentProps<typeof Icon>['icon'];
       label: string;
       isDisabled?: boolean;
       onClick: () => void;
       isMirrored?: boolean;
+      buttonRef?: React.Ref<HTMLButtonElement>;
     },
   ) => {
     const button = (
@@ -1300,6 +1711,7 @@ export function Lightbox({
             ]}
           />
         }
+        ref={buttonRef}
         label={label}
         variant="ghost"
         isDisabled={isDisabled}
@@ -1330,7 +1742,7 @@ export function Lightbox({
     ) : (
       <img
         ref={isCurrent ? stage.contentRef : undefined}
-        onLoad={placeCaption}
+        onLoad={isCurrent ? placeCaption : undefined}
         src={src}
         alt={isCurrent ? alt : ''}
         aria-hidden={isCurrent ? undefined : true}
@@ -1342,6 +1754,20 @@ export function Lightbox({
   const pageIndexes = isGallery
     ? [index - 1, index, index + 1].filter(i => i >= 0 && i < mediaArray.length)
     : [];
+  const hasCaptionBand =
+    isGallery && mediaArray.some(item => isRenderable(item.caption));
+  // Its place ends the caption's last line, unless the open caption scrolls.
+  const hasCaptionTogglePlace = hasCaptionToggle && !isCaptionScrolling;
+  // The keyboard's zoom button is the photo's wrapper. In a gallery it is the
+  // current page's photo box, so the caption band stays outside it.
+  const isWrapperZoomButton = isZoomTarget && !isGallery;
+  const zoomButtonProps = {
+    role: 'button',
+    tabIndex: 0,
+    'aria-pressed': isZoomed,
+    'aria-label': t('@astryx.lightbox.zoom'),
+    onKeyDown: handleImageKeyDown,
+  } as const;
 
   return (
     <dialog
@@ -1352,6 +1778,9 @@ export function Lightbox({
         onKeyDownProp?.(e);
       }}
       aria-label={currentItem.alt || t('@astryx.lightbox.mediaViewer')}
+      aria-describedby={
+        isRenderable(currentItem.caption) ? captionId : undefined
+      }
       {...mergeProps(
         themeProps('lightbox'),
         stylex.props(
@@ -1377,183 +1806,308 @@ export function Lightbox({
       <LayerDepthProvider>
         <ModalAnnounceProvider dialogRef={dialogRef} isOpen={isOpen}>
           <LayerContentBoundary>
-            <div
-              ref={containerRef}
-              {...stylex.props(styles.container)}
-              // Every press in the viewer records where and how it began. A
-              // mouse's or a pen's press clears a zoomed drag's flag anywhere.
-              // A finger's press clears it only on the stage.
-              onPointerDown={e => {
-                pointerTypeRef.current = e.pointerType;
-                pressPointRef.current = {x: e.clientX, y: e.clientY};
-                const isOnStage =
-                  e.target instanceof Node &&
-                  imageWrapperRef.current?.contains(e.target) === true;
-                if (e.pointerType !== 'touch' || isOnStage) {
-                  didDragRef.current = false;
-                }
-              }}>
+            {/* A media surface: the controls and the caption take the dark
+            surface tokens and the theme's rules for them. */}
+            <MediaTheme mode="dark">
               <div
-                data-lightbox-chrome=""
-                {...stylex.props(styles.chromeLayer)}>
-                {control(styles.closeButton, {
-                  icon: 'close',
-                  label: t('@astryx.lightbox.close'),
-                  onClick: handleClose,
-                })}
-
-                {/* Gallery nav: prev — stays mounted and is disabled at the start of
-              the range so pressing/arrowing to the boundary doesn't unmount the
-              focused control and drop focus to <body>. */}
-                {isGallery &&
-                  control([styles.navButton, styles.navPrev], {
-                    icon: 'chevronLeft',
-                    label: t('@astryx.lightbox.previous'),
-                    isDisabled: !canPrev,
-                    onClick: goToPrev,
-                    isMirrored: true,
-                  })}
-              </div>
-
-              {/* Media + caption group (centered together) */}
-              <div
-                ref={mediaGroupRef}
-                data-lightbox-media=""
-                {...stylex.props(
-                  styles.mediaGroup,
-                  isZoomTarget && !isGallery && styles.mediaGroupZoom,
-                  isGallery && styles.mediaGroupGallery,
-                )}>
+                ref={containerRef}
+                {...stylex.props(styles.container)}
+                // Every press in the viewer records where and how it began. A
+                // mouse's or a pen's press clears a zoomed drag's flag anywhere.
+                // A finger's press clears it only on the stage.
+                onPointerDown={e => {
+                  pointerTypeRef.current = e.pointerType;
+                  pressPointRef.current = {x: e.clientX, y: e.clientY};
+                  const isOnStage =
+                    e.target instanceof Node &&
+                    imageWrapperRef.current?.contains(e.target) === true;
+                  if (e.pointerType !== 'touch' || isOnStage) {
+                    didDragRef.current = false;
+                  }
+                }}>
                 <div
-                  ref={imageWrapperRef}
-                  // The wrapper is a keyboard-operable zoom toggle when zoom is
-                  // enabled: Enter/Space toggles, aria-pressed reflects state.
-                  role={isZoomTarget ? 'button' : undefined}
-                  tabIndex={isZoomTarget ? 0 : undefined}
-                  aria-pressed={isZoomTarget ? isZoomed : undefined}
-                  aria-label={
-                    isZoomTarget ? t('@astryx.lightbox.zoom') : undefined
-                  }
+                  data-lightbox-chrome=""
+                  {...stylex.props(styles.chromeLayer)}>
+                  {control(styles.closeButton, {
+                    icon: 'close',
+                    label: t('@astryx.lightbox.close'),
+                    onClick: handleClose,
+                    buttonRef: closeButtonRef,
+                  })}
+
+                  {/* Gallery nav: prev — stays mounted and is disabled at the start of
+                the range so pressing/arrowing to the boundary doesn't unmount the
+                focused control and drop focus to <body>. */}
+                  {isGallery &&
+                    control([styles.navButton, styles.navPrev], {
+                      icon: 'chevronLeft',
+                      label: t('@astryx.lightbox.previous'),
+                      isDisabled: !canPrev,
+                      onClick: goToPrev,
+                      isMirrored: true,
+                    })}
+                </div>
+
+                {/* Media + caption group (centered together) */}
+                <div
+                  ref={mediaGroupRef}
+                  data-lightbox-media=""
                   {...stylex.props(
-                    styles.imageWrapper,
-                    isGallery && styles.imageWrapperGallery,
-                    isZoomTarget && !isGallery && styles.imageWrapperZoomTarget,
-                    isZoomTarget && !isGallery && styles.imageWrapperFill,
-                    isTouch &&
-                      !isZoomTarget &&
-                      !isVideo &&
-                      !isGallery &&
-                      styles.imageWrapperDismissTarget,
-                    isZoomTarget && focusOutlineStyles.focusVisible,
-                    isZoomTarget && styles.imageWrapperFocusInset,
-                    isZoomTarget && !isZoomed && styles.imageWrapperZoomable,
-                    isZoomTarget && isZoomed && styles.imageWrapperZoomed,
-                  )}
-                  onKeyDown={isZoomTarget ? handleImageKeyDown : undefined}
-                  onPointerMove={
-                    isZoomTarget ? markPointerOverPhoto : undefined
-                  }
-                  onPointerLeave={
-                    isZoomTarget
-                      ? e =>
-                          e.currentTarget.removeAttribute(OVER_PHOTO_ATTRIBUTE)
-                      : undefined
-                  }
-                  onDoubleClick={
-                    isZoomTarget
-                      ? e => {
-                          // A finger's double tap is the stage's own.
-                          if (pointerTypeRef.current !== 'touch') {
-                            stage.doubleClickAt(e.clientX, e.clientY);
+                    styles.mediaGroup,
+                    isZoomTarget && !isGallery && styles.mediaGroupZoom,
+                    isGallery && styles.mediaGroupGallery,
+                  )}>
+                  <div
+                    ref={imageWrapperRef}
+                    data-lightbox-viewport=""
+                    {...(isWrapperZoomButton ? zoomButtonProps : undefined)}
+                    {...stylex.props(
+                      styles.imageWrapper,
+                      isGallery && styles.imageWrapperGallery,
+                      isZoomTarget &&
+                        !isGallery &&
+                        styles.imageWrapperZoomTarget,
+                      isZoomTarget && !isGallery && styles.imageWrapperFill,
+                      isTouch &&
+                        !isZoomTarget &&
+                        !isVideo &&
+                        !isGallery &&
+                        styles.imageWrapperDismissTarget,
+                      isWrapperZoomButton && focusOutlineStyles.focusVisible,
+                      isWrapperZoomButton && styles.zoomButtonFocusInset,
+                      isZoomTarget && !isZoomed && styles.imageWrapperZoomable,
+                      isZoomTarget && isZoomed && styles.imageWrapperZoomed,
+                    )}
+                    onPointerMove={
+                      isZoomTarget ? markPointerOverPhoto : undefined
+                    }
+                    onPointerLeave={
+                      isZoomTarget
+                        ? e =>
+                            e.currentTarget.removeAttribute(
+                              OVER_PHOTO_ATTRIBUTE,
+                            )
+                        : undefined
+                    }
+                    onDoubleClick={
+                      isZoomTarget
+                        ? e => {
+                            // A finger's double tap is the stage's own.
+                            if (pointerTypeRef.current !== 'touch') {
+                              stage.doubleClickAt(e.clientX, e.clientY);
+                            }
                           }
-                        }
-                      : undefined
-                  }>
-                  {isGallery ? (
-                    <div
-                      ref={trackRef}
-                      {...stylex.props(
-                        styles.track,
-                        isZoomTarget && styles.trackZoomTarget,
-                        isTouch &&
-                          !isZoomTarget &&
-                          !isVideo &&
-                          styles.imageWrapperDismissTarget,
-                      )}>
-                      {pageIndexes.map(i => (
-                        <div
-                          key={i}
-                          data-lightbox-page={i}
-                          data-current={i === index ? '' : undefined}
-                          // Only the current page is on screen at rest: the
-                          // others stay out of the tab order and the
-                          // accessibility tree.
-                          inert={i !== index ? true : undefined}
-                          aria-hidden={i !== index ? true : undefined}
-                          {...stylex.props(
-                            styles.page,
-                            pageStyles.position(i),
-                          )}>
+                        : undefined
+                    }>
+                    {isGallery ? (
+                      <div
+                        ref={trackRef}
+                        {...stylex.props(
+                          styles.track,
+                          isZoomTarget && styles.trackZoomTarget,
+                          isTouch &&
+                            !isZoomTarget &&
+                            !isVideo &&
+                            styles.imageWrapperDismissTarget,
+                        )}>
+                        {pageIndexes.map(i => (
                           <div
-                            ref={i === index ? pageMediaRef : undefined}
-                            data-lightbox-page-media=""
+                            key={i}
+                            data-lightbox-page={i}
+                            data-current={i === index ? '' : undefined}
+                            // Only the current page is on screen at rest: the
+                            // others stay out of the tab order and the
+                            // accessibility tree.
+                            inert={i !== index ? true : undefined}
+                            aria-hidden={i !== index ? true : undefined}
                             {...stylex.props(
-                              styles.pageMedia,
-                              isZoomTarget && styles.pageMediaZoomTarget,
+                              styles.page,
+                              pageStyles.position(i),
                             )}>
-                            {renderMedia(mediaArray[i], i === index)}
-                          </div>
-                          {isRenderable(mediaArray[i].caption) && (
                             <div
-                              data-lightbox-caption=""
-                              {...stylex.props(styles.caption)}>
-                              {mediaArray[i].caption}
+                              ref={i === index ? pageMediaRef : undefined}
+                              data-lightbox-page-media=""
+                              {...(isZoomTarget && i === index
+                                ? zoomButtonProps
+                                : undefined)}
+                              {...stylex.props(
+                                styles.pageMedia,
+                                isZoomTarget && styles.pageMediaZoomTarget,
+                                isZoomTarget &&
+                                  i === index && [
+                                    focusOutlineStyles.focusVisible,
+                                    styles.zoomButtonFocusInset,
+                                  ],
+                              )}>
+                              {renderMedia(mediaArray[i], i === index)}
                             </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    renderMedia(currentItem, true)
+                            {hasCaptionBand && (
+                              <div
+                                data-lightbox-caption-band=""
+                                {...stylex.props(
+                                  styles.captionBand,
+                                  !isRenderable(mediaArray[i].caption) &&
+                                    styles.captionBandBare,
+                                  i === index &&
+                                    isCaptionOpen &&
+                                    styles.captionBandUnderOpen,
+                                )}>
+                                {isRenderable(mediaArray[i].caption) && (
+                                  // The page's one caption: clamped in the
+                                  // band, or open over the photo's bottom.
+                                  <div
+                                    id={i === index ? fullCaptionId : undefined}
+                                    data-lightbox-caption=""
+                                    {...stylex.props(
+                                      styles.captionInBand,
+                                      i === index &&
+                                        isCaptionOpen &&
+                                        styles.captionOpen,
+                                    )}>
+                                    <div {...stylex.props(styles.captionBody)}>
+                                      <Text
+                                        ref={
+                                          i === index
+                                            ? bandCaptionMeasureRef
+                                            : undefined
+                                        }
+                                        id={i === index ? captionId : undefined}
+                                        as="div"
+                                        type="body"
+                                        maxLines={
+                                          i === index && isCaptionOpen ? 0 : 2
+                                        }
+                                        hasTruncateTooltip={false}
+                                        xstyle={[
+                                          styles.caption,
+                                          styles.captionClamped,
+                                          i === index &&
+                                            isCaptionOpen &&
+                                            styles.captionTextOpen,
+                                          i === index &&
+                                            hasCaptionToggle &&
+                                            isCaptionScrolling &&
+                                            styles.captionTextBesideToggle(
+                                              captionToggleWidth,
+                                            ),
+                                        ]}>
+                                        <div
+                                          {...stylex.props(styles.captionFlow)}>
+                                          <span
+                                            aria-hidden="true"
+                                            {...stylex.props(
+                                              styles.captionToggleSpacer,
+                                              i === index &&
+                                                hasCaptionTogglePlace &&
+                                                styles.captionToggleSpacerHeight(
+                                                  captionLastLineTop,
+                                                ),
+                                            )}
+                                          />
+                                          <span
+                                            aria-hidden="true"
+                                            {...stylex.props(
+                                              styles.captionTogglePlace,
+                                              i === index &&
+                                                hasCaptionTogglePlace &&
+                                                styles.captionTogglePlaceShown(
+                                                  captionToggleWidth,
+                                                ),
+                                            )}
+                                          />
+                                          {mediaArray[i].caption}
+                                        </div>
+                                      </Text>
+                                      {i === index && (
+                                        // Mounted with the caption, and hidden
+                                        // until the caption needs it. So a
+                                        // measurement only shows or hides it,
+                                        // and adds no element.
+                                        <Link
+                                          ref={captionToggleRefs}
+                                          hidden={!hasCaptionToggle}
+                                          type="inherit"
+                                          // On the media surface a link's
+                                          // colour is close to the caption's.
+                                          // The underline sets it apart.
+                                          hasUnderline
+                                          aria-expanded={isCaptionOpen}
+                                          aria-controls={fullCaptionId}
+                                          onClick={() =>
+                                            setOpenCaptionIndex(
+                                              isCaptionOpen ? null : index,
+                                            )
+                                          }
+                                          xstyle={
+                                            [
+                                              styles.captionToggle,
+                                              touchHitAreaStyles.layer,
+                                              !hasCaptionToggle &&
+                                                styles.captionToggleHidden,
+                                            ] as StyleXStyles
+                                          }>
+                                          {isCaptionOpen
+                                            ? t('@astryx.lightbox.captionLess')
+                                            : t('@astryx.lightbox.captionMore')}
+                                        </Link>
+                                      )}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      renderMedia(currentItem, true)
+                    )}
+                  </div>
+
+                  {!isGallery && isRenderable(currentItem.caption) && (
+                    <Text
+                      ref={captionRef}
+                      id={captionId}
+                      data-lightbox-caption=""
+                      as="div"
+                      type="body"
+                      xstyle={styles.caption}>
+                      {currentItem.caption}
+                    </Text>
                   )}
                 </div>
 
-                {!isGallery && isRenderable(currentItem.caption) && (
-                  <div
-                    ref={captionRef}
-                    data-lightbox-caption=""
-                    {...stylex.props(styles.caption)}>
-                    {currentItem.caption}
-                  </div>
-                )}
-              </div>
+                <div
+                  data-lightbox-chrome=""
+                  {...stylex.props(styles.chromeLayer)}>
+                  {/* Gallery nav: next — see "prev" above; stays mounted and disabled at
+              the end of the range instead of unmounting. */}
+                  {isGallery &&
+                    control([styles.navButton, styles.navNext], {
+                      icon: 'chevronRight',
+                      label: t('@astryx.lightbox.next'),
+                      isDisabled: !canNext,
+                      onClick: goToNext,
+                      isMirrored: true,
+                    })}
 
-              <div
-                data-lightbox-chrome=""
-                {...stylex.props(styles.chromeLayer)}>
-                {/* Gallery nav: next — see "prev" above; stays mounted and disabled at
-            the end of the range instead of unmounting. */}
-                {isGallery &&
-                  control([styles.navButton, styles.navNext], {
-                    icon: 'chevronRight',
-                    label: t('@astryx.lightbox.next'),
-                    isDisabled: !canNext,
-                    onClick: goToNext,
-                    isMirrored: true,
-                  })}
-
-                {/* Gallery counter */}
-                {isGallery && mediaArray.length > 1 && (
-                  <div
-                    {...stylex.props(
-                      styles.counter,
-                      hasZoom && styles.counterBacking,
-                    )}>
-                    {index + 1} / {mediaArray.length}
-                  </div>
-                )}
+                  {/* Gallery counter */}
+                  {isGallery && mediaArray.length > 1 && (
+                    <Text
+                      as="div"
+                      type="body"
+                      color={hasZoom ? 'inherit' : undefined}
+                      xstyle={[
+                        styles.counter,
+                        hasZoom && styles.counterBacking,
+                        hasZoom && styles.counterOnDark,
+                      ]}>
+                      {index + 1} / {mediaArray.length}
+                    </Text>
+                  )}
+                </div>
               </div>
-            </div>
+            </MediaTheme>
           </LayerContentBoundary>
         </ModalAnnounceProvider>
       </LayerDepthProvider>
